@@ -41,6 +41,10 @@ import (
 
 const (
 	controllerName = "cluster_endpoints_controller"
+	// reconcileProbeBudget bounds the total time spent probing hosts for a
+	// single reconcile. Probes honour this deadline between attempts and the
+	// per-probe timeout is clamped, so a reconcile cannot hang forever.
+	reconcileProbeBudget = 5 * time.Minute
 )
 
 // Reconciler reconciles a Service object
@@ -109,6 +113,8 @@ func (c *Reconciler) reconcile(ctx context.Context, obj client.Object) (ctrl.Res
 	if !ok {
 		return ctrl.Result{}, errors.New("obj convert cep is error")
 	}
+	probeCtx, cancel := context.WithTimeout(ctx, reconcileProbeBudget)
+	defer cancel()
 
 	initializedCondition := v1beta1.Condition{
 		Type:               v1beta1.Initialized,
@@ -124,7 +130,7 @@ func (c *Reconciler) reconcile(ctx context.Context, obj client.Object) (ctrl.Res
 	}
 
 	c.syncService(ctx, cep)
-	c.syncEndpoint(ctx, cep)
+	c.syncEndpoint(probeCtx, cep)
 
 	c.logger.V(4).Info("update finished reconcile controller service", "request", client.ObjectKeyFromObject(cep))
 	c.syncFinalStatus(cep)
@@ -133,9 +139,9 @@ func (c *Reconciler) reconcile(ctx context.Context, obj client.Object) (ctrl.Res
 		c.recorder.Eventf(cep, corev1.EventTypeWarning, "SyncStatus", "Sync status %s is error: %v", cep.Name, err)
 		return ctrl.Result{}, err
 	}
-	sec := time.Duration(cep.Spec.PeriodSeconds) * time.Second
-	if cep.Spec.PeriodSeconds == 0 {
+	period := normalizePeriodSeconds(cep.Spec.PeriodSeconds)
+	if period == 0 {
 		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{RequeueAfter: sec}, nil
+	return ctrl.Result{RequeueAfter: time.Duration(period) * time.Second}, nil
 }

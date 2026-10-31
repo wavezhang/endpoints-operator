@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"github.com/labring/endpoints-operator/utils/metrics"
 	"strconv"
 	"sync"
@@ -32,6 +33,56 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+const (
+	defaultTimeoutSeconds   int32 = 1
+	defaultSuccessThreshold int32 = 1
+	defaultFailureThreshold int32 = 3
+
+	maxTimeoutSeconds   int32 = 60
+	maxProbeThreshold   int32 = 10
+	maxPeriodSeconds    int32 = 3600
+	maxProbeAttempts          = 10
+	maxProbeConcurrency       = 16
+)
+
+// probeSemaphore bounds the total number of in-flight probes across all
+// reconciles so a single large ClusterEndpoint cannot spawn an unbounded number
+// of goroutines and sockets.
+var probeSemaphore = make(chan struct{}, maxProbeConcurrency)
+
+// clampProbeValue normalizes a user supplied probe value into a safe range.
+// Zero and negative values fall back to the default, values above the upper
+// bound are truncated to it.
+func clampProbeValue(value, defaultValue, maximum int32) int32 {
+	switch {
+	case value <= 0:
+		return defaultValue
+	case value > maximum:
+		return maximum
+	default:
+		return value
+	}
+}
+
+// normalizeProbeSettings clamps the per-port probe settings copied from the CR.
+func normalizeProbeSettings(port *v1beta1.ServicePort) {
+	port.TimeoutSeconds = clampProbeValue(port.TimeoutSeconds, defaultTimeoutSeconds, maxTimeoutSeconds)
+	port.SuccessThreshold = clampProbeValue(port.SuccessThreshold, defaultSuccessThreshold, maxProbeThreshold)
+	port.FailureThreshold = clampProbeValue(port.FailureThreshold, defaultFailureThreshold, maxProbeThreshold)
+}
+
+// normalizePeriodSeconds clamps spec.periodSeconds. Zero keeps the historical
+// "no periodic requeue" behaviour, negative values are treated as zero.
+func normalizePeriodSeconds(period int32) int32 {
+	if period <= 0 {
+		return 0
+	}
+	if period > maxPeriodSeconds {
+		return maxPeriodSeconds
+	}
+	return period
+}
 
 func (c *Reconciler) syncService(ctx context.Context, cep *v1beta1.ClusterEndpoint) {
 	serviceCondition := v1beta1.Condition{
@@ -87,7 +138,7 @@ func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpo
 	var syncError error = nil
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 
-		subsets, convertError := clusterEndpointConvertEndpointSubset(cep, c.RetryCount, c.MetricsInfo)
+		subsets, convertError := clusterEndpointConvertEndpointSubset(ctx, cep, c.RetryCount, c.MetricsInfo)
 
 		if convertError != nil && len(convertError) != 0 {
 			syncError = ToAggregate(convertError)
@@ -128,7 +179,7 @@ func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpo
 	}
 }
 
-func clusterEndpointConvertEndpointSubset(cep *v1beta1.ClusterEndpoint, retry int, metricsinfo *metrics.MetricsInfo) ([]corev1.EndpointSubset, []error) {
+func clusterEndpointConvertEndpointSubset(ctx context.Context, cep *v1beta1.ClusterEndpoint, retry int, metricsinfo *metrics.MetricsInfo) ([]corev1.EndpointSubset, []error) {
 	var wg sync.WaitGroup
 	var mx sync.Mutex
 	var data []corev1.EndpointSubset
@@ -140,15 +191,16 @@ func clusterEndpointConvertEndpointSubset(cep *v1beta1.ClusterEndpoint, retry in
 			wg.Add(1)
 			go func(port v1beta1.ServicePort, host string) {
 				defer wg.Done()
-				if port.TimeoutSeconds == 0 {
-					port.TimeoutSeconds = 1
+				select {
+				case probeSemaphore <- struct{}{}:
+					defer func() { <-probeSemaphore }()
+				case <-ctx.Done():
+					mx.Lock()
+					errors = append(errors, ctx.Err())
+					mx.Unlock()
+					return
 				}
-				if port.SuccessThreshold == 0 {
-					port.SuccessThreshold = 1
-				}
-				if port.FailureThreshold == 0 {
-					port.FailureThreshold = 3
-				}
+				normalizeProbeSettings(&port)
 				pro := &libv1.Probe{
 					TimeoutSeconds:   port.TimeoutSeconds,
 					SuccessThreshold: port.SuccessThreshold,
@@ -211,8 +263,33 @@ func clusterEndpointConvertEndpointSubset(cep *v1beta1.ClusterEndpoint, retry in
 						Service: port.GRPC.Service,
 					}
 				}
+				// The number of attempts is capped by maxProbeAttempts so user
+				// supplied thresholds cannot keep this loop running forever.
 				w := &work{p: pro, retry: retry}
-				for w.doProbe() {
+				attempts := int(pro.SuccessThreshold)
+				if int(pro.FailureThreshold) > attempts {
+					attempts = int(pro.FailureThreshold)
+				}
+				if attempts > maxProbeAttempts {
+					attempts = maxProbeAttempts
+				}
+				keepGoing := true
+				for i := 0; i < attempts; i++ {
+					if err := ctx.Err(); err != nil {
+						w.err = err
+						keepGoing = false
+						break
+					}
+					keepGoing = w.doProbe()
+					if !keepGoing {
+						break
+					}
+				}
+				if keepGoing {
+					// The attempt budget was exhausted before the configured
+					// threshold was reached; fail closed instead of reporting
+					// the host as healthy.
+					w.err = fmt.Errorf("probe attempt budget of %d exceeded without reaching threshold", attempts)
 				}
 				mx.Lock()
 				defer mx.Unlock()

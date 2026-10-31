@@ -52,6 +52,8 @@ spec:
                 description: How often (in seconds) to perform the probe. Default
                   to 10 seconds. Minimum value is 1.
                 format: int32
+                maximum: 3600
+                minimum: 1
                 type: integer
               ports:
                 items:
@@ -62,6 +64,8 @@ spec:
                         considered failed after having succeeded. Defaults to 3. Minimum
                         value is 1.
                       format: int32
+                      maximum: 10
+                      minimum: 1
                       type: integer
                     grpc:
                       description: GRPC specifies an action involving a GRPC port.
@@ -81,7 +85,9 @@ spec:
                       type: object
                     hosts:
                       items:
+                        format: ip
                         type: string
+                      maxItems: 64
                       type: array
                     httpGet:
                       description: HTTPGet specifies the http request to perform.
@@ -133,6 +139,8 @@ spec:
                         be considered successful after having failed. Defaults to
                         1. Must be 1 for liveness and startup. Minimum value is 1.
                       format: int32
+                      maximum: 10
+                      minimum: 1
                       type: integer
                     targetPort:
                       description: Number or name of the port to access on the pods
@@ -157,6 +165,8 @@ spec:
                         out. Defaults to 1 second. Minimum value is 1. More info:
                         https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle#container-probes'
                       format: int32
+                      maximum: 60
+                      minimum: 1
                       type: integer
                     udpSocket:
                       description: UDPSocketAction specifies an action involving a
@@ -176,6 +186,7 @@ spec:
                   - port
                   - targetPort
                   type: object
+                maxItems: 32
                 type: array
             type: object
           status:
