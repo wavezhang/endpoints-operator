@@ -17,16 +17,42 @@ limitations under the License.
 package controllers
 
 import (
-	"github.com/labring/endpoints-operator/utils/metrics"
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 
 	"github.com/labring/endpoints-operator/apis/network/v1beta1"
+	"github.com/labring/endpoints-operator/utils/metrics"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer tcpListener.Close()
+	go func() {
+		for {
+			conn, err := tcpListener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	tcpPort := int32(tcpListener.Addr().(*net.TCPAddr).Port)
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpServer.Close()
+	httpPort := int32(httpServer.Listener.Addr().(*net.TCPAddr).Port)
+
 	type args struct {
 		cep         *v1beta1.ClusterEndpoint
 		retry       int
@@ -50,7 +76,7 @@ func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
 					Spec: v1beta1.ClusterEndpointSpec{
 						Ports: []v1beta1.ServicePort{
 							{
-								Hosts: []string{"172.18.1.38", "172.18.1.69", "172.18.2.18"},
+								Hosts: []string{"127.0.0.1"},
 								Handler: v1beta1.Handler{
 									TCPSocket: &v1beta1.TCPSocketAction{Enable: true},
 								},
@@ -60,7 +86,7 @@ func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
 								Name:             "default",
 								Protocol:         "TCP",
 								Port:             8080,
-								TargetPort:       31381,
+								TargetPort:       tcpPort,
 							},
 						},
 						PeriodSeconds: 0,
@@ -69,7 +95,12 @@ func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
 				retry:       3,
 				metricsinfo: nil,
 			},
-			want:  nil,
+			want: []corev1.EndpointSubset{
+				{
+					Addresses: []corev1.EndpointAddress{{IP: "127.0.0.1"}},
+					Ports:     []corev1.EndpointPort{{Name: "default", Port: tcpPort, Protocol: corev1.ProtocolTCP}},
+				},
+			},
 			want1: nil,
 		},
 		{
@@ -84,7 +115,7 @@ func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
 					Spec: v1beta1.ClusterEndpointSpec{
 						Ports: []v1beta1.ServicePort{
 							{
-								Hosts: []string{"172.31.13.241", "172.31.3.240", "172.31.4.233"},
+								Hosts: []string{"127.0.0.1"},
 								Handler: v1beta1.Handler{
 									HTTPGet: &v1beta1.HTTPGetAction{
 										Path:   "/",
@@ -97,7 +128,7 @@ func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
 								Name:             "default",
 								Protocol:         "TCP",
 								Port:             8848,
-								TargetPort:       8848,
+								TargetPort:       httpPort,
 							},
 						},
 						PeriodSeconds: 0,
@@ -106,13 +137,18 @@ func Test_clusterEndpointConvertEndpointSubset(t *testing.T) {
 				retry:       3,
 				metricsinfo: nil,
 			},
-			want:  nil,
+			want: []corev1.EndpointSubset{
+				{
+					Addresses: []corev1.EndpointAddress{{IP: "127.0.0.1"}},
+					Ports:     []corev1.EndpointPort{{Name: "default", Port: httpPort, Protocol: corev1.ProtocolTCP}},
+				},
+			},
 			want1: nil,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, got1 := clusterEndpointConvertEndpointSubset(tt.args.cep, tt.args.retry, tt.args.metricsinfo)
+			got, got1 := clusterEndpointConvertEndpointSubset(context.Background(), tt.args.cep, tt.args.retry, tt.args.metricsinfo)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("clusterEndpointConvertEndpointSubset() got = %v, want %v", got, tt.want)
 			}
