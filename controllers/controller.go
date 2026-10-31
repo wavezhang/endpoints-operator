@@ -123,8 +123,13 @@ func (c *Reconciler) reconcile(ctx context.Context, obj client.Object) (ctrl.Res
 		c.updateCondition(cep, initializedCondition)
 	}
 
-	c.syncService(ctx, cep)
-	c.syncEndpoint(ctx, cep)
+	// Never touch Endpoints when the Service could not be synced: doing so
+	// would let a ClusterEndpoint take over Endpoints even when the owning
+	// Service is managed by somebody else.
+	syncErr := c.syncService(ctx, cep)
+	if syncErr == nil {
+		syncErr = c.syncEndpoint(ctx, cep)
+	}
 
 	c.logger.V(4).Info("update finished reconcile controller service", "request", client.ObjectKeyFromObject(cep))
 	c.syncFinalStatus(cep)
@@ -132,6 +137,9 @@ func (c *Reconciler) reconcile(ctx context.Context, obj client.Object) (ctrl.Res
 	if err != nil {
 		c.recorder.Eventf(cep, corev1.EventTypeWarning, "SyncStatus", "Sync status %s is error: %v", cep.Name, err)
 		return ctrl.Result{}, err
+	}
+	if syncErr != nil {
+		return ctrl.Result{}, syncErr
 	}
 	sec := time.Duration(cep.Spec.PeriodSeconds) * time.Second
 	if cep.Spec.PeriodSeconds == 0 {
