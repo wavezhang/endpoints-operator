@@ -18,7 +18,11 @@ package controllers
 
 import (
 	"context"
+	"errors"
+	"fmt"
+
 	"github.com/labring/endpoints-operator/utils/metrics"
+
 	"strconv"
 	"sync"
 
@@ -27,13 +31,59 @@ import (
 	"github.com/labring/endpoints-operator/apis/network/v1beta1"
 	libv1 "github.com/labring/operator-sdk/api/core/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-func (c *Reconciler) syncService(ctx context.Context, cep *v1beta1.ClusterEndpoint) {
+const (
+	// managedByLabelKey marks Service/Endpoints objects owned by this operator.
+	// Objects without it are never adopted, so a ClusterEndpoint cannot hijack
+	// manually maintained Services or Endpoints.
+	managedByLabelKey   = "sealos.io/managed-by"
+	managedByLabelValue = "endpoints-operator"
+)
+
+// errAdoptionRefused is returned when an existing Service or Endpoints object is
+// not already managed by this operator.
+var errAdoptionRefused = errors.New("refusing to adopt existing object")
+
+// validateExistingObject fetches obj and reports whether it already exists. If
+// it exists but is not managed by this operator (managed-by label plus the CEP
+// as controller owner), adoption is refused.
+func (c *Reconciler) validateExistingObject(ctx context.Context, obj client.Object, cep *v1beta1.ClusterEndpoint) (bool, error) {
+	if err := c.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if obj.GetLabels()[managedByLabelKey] != managedByLabelValue {
+		return true, fmt.Errorf("%w: existing %T %s/%s is missing label %s=%s", errAdoptionRefused,
+			obj, obj.GetNamespace(), obj.GetName(), managedByLabelKey, managedByLabelValue)
+	}
+	if !metav1.IsControlledBy(obj, cep) {
+		return true, fmt.Errorf("%w: existing %T %s/%s is not controlled by ClusterEndpoint %s/%s", errAdoptionRefused,
+			obj, obj.GetNamespace(), obj.GetName(), cep.Namespace, cep.Name)
+	}
+	return true, nil
+}
+
+// reportSyncError records a failed sync condition and returns the error.
+func (c *Reconciler) reportSyncError(cep *v1beta1.ClusterEndpoint, condition *v1beta1.Condition, reason string, err error, logMsg string) error {
+	condition.LastHeartbeatTime = metav1.Now()
+	condition.Status = corev1.ConditionFalse
+	condition.Reason = reason
+	condition.Message = err.Error()
+	c.updateCondition(cep, *condition)
+	c.logger.V(4).Info(logMsg, "name", cep.Name, "msg", err.Error())
+	return err
+}
+
+func (c *Reconciler) syncService(ctx context.Context, cep *v1beta1.ClusterEndpoint) error {
 	serviceCondition := v1beta1.Condition{
 		Type:               v1beta1.SyncServiceReady,
 		Status:             corev1.ConditionTrue,
@@ -43,12 +93,31 @@ func (c *Reconciler) syncService(ctx context.Context, cep *v1beta1.ClusterEndpoi
 		Message:            "sync service successfully",
 	}
 
+	svc := &corev1.Service{}
+	svc.SetName(cep.Name)
+	svc.SetNamespace(cep.Namespace)
+	existed, err := c.validateExistingObject(ctx, svc, cep)
+	if err != nil {
+		reason := "ServiceSyncError"
+		if errors.Is(err, errAdoptionRefused) {
+			reason = "AdoptionRefused"
+			c.recorder.Eventf(cep, corev1.EventTypeWarning, "AdoptionRefused", "%v", err)
+		}
+		return c.reportSyncError(cep, &serviceCondition, reason, err, "error updating service")
+	}
+	if existed {
+		c.logger.V(2).Info("adopting existing managed service", "namespace", cep.Namespace, "name", cep.Name)
+		c.recorder.Eventf(cep, corev1.EventTypeNormal, "AdoptedExistingService", "Adopting existing Service %s/%s", cep.Namespace, cep.Name)
+	}
+
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		svc := &corev1.Service{}
-		svc.SetName(cep.Name)
-		svc.SetNamespace(cep.Namespace)
 		_, err := controllerutil.CreateOrUpdate(ctx, c.Client, svc, func() error {
-			svc.Labels = cep.Labels
+			labels := make(map[string]string, len(cep.Labels)+1)
+			for k, v := range cep.Labels {
+				labels[k] = v
+			}
+			labels[managedByLabelKey] = managedByLabelValue
+			svc.Labels = labels
 			svc.Annotations = cep.Annotations
 			if err := controllerutil.SetControllerReference(cep, svc, c.scheme); err != nil {
 				return err
@@ -63,19 +132,15 @@ func (c *Reconciler) syncService(ctx context.Context, cep *v1beta1.ClusterEndpoi
 		})
 		return err
 	}); err != nil {
-		serviceCondition.LastHeartbeatTime = metav1.Now()
-		serviceCondition.Status = corev1.ConditionFalse
-		serviceCondition.Reason = "ServiceSyncError"
-		serviceCondition.Message = err.Error()
-		c.updateCondition(cep, serviceCondition)
-		c.logger.V(4).Info("error updating service", "name", cep.Name, "msg", err.Error())
-		return
+		return c.reportSyncError(cep, &serviceCondition, "ServiceSyncError", err, "error updating service")
 	}
 	if !isConditionTrue(cep, v1beta1.SyncServiceReady) {
 		c.updateCondition(cep, serviceCondition)
 	}
+	return nil
 }
-func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpoint) {
+
+func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpoint) error {
 	endpointCondition := v1beta1.Condition{
 		Type:               v1beta1.SyncEndpointReady,
 		Status:             corev1.ConditionTrue,
@@ -84,6 +149,24 @@ func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpo
 		Reason:             string(v1beta1.SyncEndpointReady),
 		Message:            "sync endpoint successfully",
 	}
+
+	ep := &corev1.Endpoints{}
+	ep.SetName(cep.Name)
+	ep.SetNamespace(cep.Namespace)
+	existed, err := c.validateExistingObject(ctx, ep, cep)
+	if err != nil {
+		reason := "EndpointSyncError"
+		if errors.Is(err, errAdoptionRefused) {
+			reason = "AdoptionRefused"
+			c.recorder.Eventf(cep, corev1.EventTypeWarning, "AdoptionRefused", "%v", err)
+		}
+		return c.reportSyncError(cep, &endpointCondition, reason, err, "error updating endpoint")
+	}
+	if existed {
+		c.logger.V(2).Info("adopting existing managed endpoints", "namespace", cep.Namespace, "name", cep.Name)
+		c.recorder.Eventf(cep, corev1.EventTypeNormal, "AdoptedExistingEndpoints", "Adopting existing Endpoints %s/%s", cep.Namespace, cep.Name)
+	}
+
 	var syncError error = nil
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 
@@ -92,12 +175,9 @@ func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpo
 		if convertError != nil && len(convertError) != 0 {
 			syncError = ToAggregate(convertError)
 		}
-		ep := &corev1.Endpoints{}
-		ep.SetName(cep.Name)
-		ep.SetNamespace(cep.Namespace)
 
 		_, err := controllerutil.CreateOrUpdate(ctx, c.Client, ep, func() error {
-			ep.Labels = map[string]string{}
+			ep.Labels = map[string]string{managedByLabelKey: managedByLabelValue}
 			if err := controllerutil.SetControllerReference(cep, ep, c.scheme); err != nil {
 				return err
 			}
@@ -106,26 +186,15 @@ func (c *Reconciler) syncEndpoint(ctx context.Context, cep *v1beta1.ClusterEndpo
 		})
 		return err
 	}); err != nil {
-		endpointCondition.LastHeartbeatTime = metav1.Now()
-		endpointCondition.Status = corev1.ConditionFalse
-		endpointCondition.Reason = "EndpointSyncError"
-		endpointCondition.Message = err.Error()
-		c.updateCondition(cep, endpointCondition)
-		c.logger.V(4).Info("error updating endpoint", "name", cep.Name, "msg", err.Error())
-		return
+		return c.reportSyncError(cep, &endpointCondition, "EndpointSyncError", err, "error updating endpoint")
 	}
 	if syncError != nil {
-		endpointCondition.LastHeartbeatTime = metav1.Now()
-		endpointCondition.Status = corev1.ConditionFalse
-		endpointCondition.Reason = "EndpointSyncPortError"
-		endpointCondition.Message = syncError.Error()
-		c.updateCondition(cep, endpointCondition)
-		c.logger.V(4).Info("error healthy endpoint", "name", cep.Name, "msg", syncError.Error())
-		return
+		return c.reportSyncError(cep, &endpointCondition, "EndpointSyncPortError", syncError, "error healthy endpoint")
 	}
 	if !isConditionTrue(cep, v1beta1.SyncEndpointReady) {
 		c.updateCondition(cep, endpointCondition)
 	}
+	return nil
 }
 
 func clusterEndpointConvertEndpointSubset(cep *v1beta1.ClusterEndpoint, retry int, metricsinfo *metrics.MetricsInfo) ([]corev1.EndpointSubset, []error) {
